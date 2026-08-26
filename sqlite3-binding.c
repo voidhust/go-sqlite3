@@ -26161,6 +26161,7 @@ SQLITE_API int sqlite3_vfs_register(sqlite3_vfs *pVfs, int makeDflt){
   return SQLITE_OK;
 }
 
+
 /*
 ** Unregister a VFS so that it is no longer accessible.
 */
@@ -46241,6 +46242,46 @@ SQLITE_API int sqlite3_os_init(void){
 */
 SQLITE_API int sqlite3_os_end(void){
   unixBigLock = 0;
+  return SQLITE_OK;
+}
+
+/* AIIK descriptor-VFS private fork boundary; see sqlite3-binding.h. */
+typedef struct sqlite3_aiik_descriptor_file sqlite3_aiik_descriptor_file;
+struct sqlite3_aiik_descriptor_file {
+  int fd;
+  sqlite3_uint64 device;
+  sqlite3_uint64 inode;
+  sqlite3_uint64 link_count;
+  unsigned int file_type;
+};
+SQLITE_API int sqlite3_aiik_descriptor_validate(
+  const sqlite3_aiik_descriptor_file *pExpected,
+  int requireRegular
+){
+  struct stat st;
+  int ownedFd;
+  if( pExpected==0 || pExpected->fd<0 ) return SQLITE_MISUSE_BKPT;
+  ownedFd = dup(pExpected->fd);
+  if( ownedFd<0 ) return SQLITE_IOERR_FSTAT;
+  if( osFstat(ownedFd, &st)!=0 ){
+    close(ownedFd);
+    return SQLITE_IOERR_FSTAT;
+  }
+  close(ownedFd);
+  if( requireRegular && !S_ISREG(st.st_mode) ) return SQLITE_MISMATCH;
+  if( pExpected->device!=0 && pExpected->device!=(sqlite3_uint64)st.st_dev ){
+    return SQLITE_MISMATCH;
+  }
+  if( pExpected->inode!=0 && pExpected->inode!=(sqlite3_uint64)st.st_ino ){
+    return SQLITE_MISMATCH;
+  }
+  if( pExpected->link_count!=0 && pExpected->link_count!=(sqlite3_uint64)st.st_nlink ){
+    return SQLITE_MISMATCH;
+  }
+  if( pExpected->file_type!=0
+   && pExpected->file_type!=(unsigned int)(st.st_mode&S_IFMT) ){
+    return SQLITE_MISMATCH;
+  }
   return SQLITE_OK;
 }
 

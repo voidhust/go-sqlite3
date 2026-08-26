@@ -7942,6 +7942,24 @@ SQLITE_API int sqlite3_vfs_register(sqlite3_vfs*, int makeDflt);
 SQLITE_API int sqlite3_vfs_unregister(sqlite3_vfs*);
 
 /*
+** AIIK descriptor-VFS private fork boundary. These entrypoints are not part
+** of upstream SQLite's public API and are reachable only from the fork's
+** build-tag-gated Go adapter. They intentionally accept file descriptors,
+** never locators.
+*/
+typedef struct sqlite3_aiik_descriptor_file sqlite3_aiik_descriptor_file;
+struct sqlite3_aiik_descriptor_file {
+  int fd;
+  sqlite3_uint64 device;
+  sqlite3_uint64 inode;
+  sqlite3_uint64 link_count;
+  unsigned int file_type;
+};
+SQLITE_API int sqlite3_aiik_descriptor_validate(
+  const sqlite3_aiik_descriptor_file*, int
+);
+
+/*
 ** CAPI3REF: Mutexes
 **
 ** The SQLite core uses these routines for thread
