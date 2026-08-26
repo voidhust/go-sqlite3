@@ -1,4 +1,4 @@
-//go:build aiik_descriptor_vfs && cgo && (darwin || linux) && !libsqlite3
+//go:build aiik_descriptor_vfs && aiik_descriptor_vfs_test && cgo && (darwin || linux) && !libsqlite3
 
 package sqlite3
 
@@ -79,11 +79,21 @@ func aiikTestSource(t *testing.T, dir string) AIIKDescriptorSource {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = shm.Close() })
-	return AIIKDescriptorSource{
+	source := AIIKDescriptorSource{
 		Database: aiikTestDescriptorFile(t, db),
 		WAL:      aiikTestDescriptorFile(t, wal),
 		SHM:      aiikTestDescriptorFile(t, shm),
 	}
+	source.Anchor = AIIKUnixConnectionInfo{
+		Database:      AIIKDescriptorIdentity{Device: source.Database.Device, Inode: source.Database.Inode, LinkCount: source.Database.LinkCount, FileType: source.Database.FileType},
+		WALPresent:    true,
+		WAL:           AIIKDescriptorIdentity{Device: source.WAL.Device, Inode: source.WAL.Inode, LinkCount: source.WAL.LinkCount, FileType: source.WAL.FileType},
+		SHMPresent:    true,
+		SHM:           AIIKDescriptorIdentity{Device: source.SHM.Device, Inode: source.SHM.Inode, LinkCount: source.SHM.LinkCount, FileType: source.SHM.FileType},
+		Filesystem:    "apfs",
+		LockingMethod: "posix",
+	}
+	return source
 }
 
 func TestAIIKDescriptorVFSRejectsMissingSourceSidecars(t *testing.T) {
@@ -153,6 +163,24 @@ func TestAIIKDescriptorVFSRequiresReadOnlySourceMainAndWAL(t *testing.T) {
 	})
 	if err == nil {
 		t.Fatal("source accepted a writable database and WAL descriptor")
+	}
+}
+
+func TestAIIKDescriptorVFSRejectsMissingOrMismatchedAnchorAuthority(t *testing.T) {
+	source := aiikTestSource(t, t.TempDir())
+	source.Anchor = AIIKUnixConnectionInfo{}
+	if _, err := OpenAIIKDescriptorSource(source); err == nil {
+		t.Fatal("source accepted missing stock-anchor authority")
+	}
+	source = aiikTestSource(t, t.TempDir())
+	source.Anchor.LockingMethod = "unknown"
+	if _, err := OpenAIIKDescriptorSource(source); err == nil {
+		t.Fatal("source accepted mismatched stock locking authority")
+	}
+	source = aiikTestSource(t, t.TempDir())
+	source.Anchor.DescriptorVFS = true
+	if _, err := OpenAIIKDescriptorSource(source); err == nil {
+		t.Fatal("source accepted a non-stock anchor authority")
 	}
 }
 
@@ -241,7 +269,8 @@ func TestAIIKDescriptorVFSDeferredCloseUsesStockUnusedFD(t *testing.T) {
 
 func TestAIIKDescriptorVFSSourceRejectsWritesBeforeMutation(t *testing.T) {
 	dir := t.TempDir()
-	conn, err := OpenAIIKDescriptorSource(aiikTestSource(t, dir))
+	source := aiikTestSource(t, dir)
+	conn, err := OpenAIIKDescriptorSource(source)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -252,7 +281,8 @@ func TestAIIKDescriptorVFSSourceRejectsWritesBeforeMutation(t *testing.T) {
 }
 
 func TestAIIKDescriptorVFSConsumesRegisteredWALRoleWithoutPathLookup(t *testing.T) {
-	conn, err := OpenAIIKDescriptorSource(aiikTestSource(t, t.TempDir()))
+	source := aiikTestSource(t, t.TempDir())
+	conn, err := OpenAIIKDescriptorSource(source)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -264,7 +294,17 @@ func TestAIIKDescriptorVFSConsumesRegisteredWALRoleWithoutPathLookup(t *testing.
 
 func TestAIIKDescriptorVFSAdoptsAndRejectsMismatchedSHM(t *testing.T) {
 	dir := t.TempDir()
-	conn, err := OpenAIIKDescriptorSource(aiikTestSource(t, dir))
+	source := aiikTestSource(t, dir)
+	ordinary, err := (&SQLiteDriver{}).Open(filepath.Join(dir, "source.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = ordinary.Close() })
+	if err := aiikTestHoldStockSHM(ordinary.(*SQLiteConn)); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = aiikTestReleaseStockSHM(ordinary.(*SQLiteConn)) })
+	conn, err := OpenAIIKDescriptorSource(source)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -318,11 +358,14 @@ func TestAIIKDescriptorVFSDoesNotChangeDefaultDriverOpen(t *testing.T) {
 }
 
 func TestAIIKDescriptorVFSRejectsForbiddenRoleBeforePathOpen(t *testing.T) {
-	if aiikTestForbiddenOpen() == nil {
-		t.Fatal("private descriptor VFS accepted a temporary database role")
+	source := aiikTestSource(t, t.TempDir())
+	conn, err := OpenAIIKDescriptorSource(source)
+	if err != nil {
+		t.Fatal(err)
 	}
-	if outstanding := aiikTestOutstandingDuplicates(); outstanding != 0 {
-		t.Fatalf("forbidden role retained %d duplicated descriptors", outstanding)
+	t.Cleanup(func() { _ = conn.Close() })
+	if err := aiikTestForbiddenOpen(conn); err != nil {
+		t.Fatalf("forbidden registered endpoint role was not rejected cleanly: %v", err)
 	}
 }
 

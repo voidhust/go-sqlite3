@@ -7962,22 +7962,32 @@ SQLITE_API int sqlite3_aiik_descriptor_validate(
   const sqlite3_aiik_descriptor_file*, int
 );
 typedef struct sqlite3_aiik_descriptor_info sqlite3_aiik_descriptor_info;
-struct sqlite3_aiik_descriptor_info {
-  int descriptor_vfs;
+typedef struct sqlite3_aiik_descriptor_identity sqlite3_aiik_descriptor_identity;
+struct sqlite3_aiik_descriptor_identity {
   sqlite3_uint64 device;
   sqlite3_uint64 inode;
   sqlite3_uint64 link_count;
   unsigned int file_type;
+};
+struct sqlite3_aiik_descriptor_info {
+  int descriptor_vfs;
+  sqlite3_aiik_descriptor_identity database;
+  int wal_present;
+  sqlite3_aiik_descriptor_identity wal;
+  int shm_present;
+  sqlite3_aiik_descriptor_identity shm;
   unsigned int filesystem;
   unsigned int locking_method;
 };
 SQLITE_API int sqlite3_aiik_descriptor_open(
-  const sqlite3_aiik_descriptor_file*, int, sqlite3**
+  const sqlite3_aiik_descriptor_file*, int,
+  const sqlite3_aiik_descriptor_info*, sqlite3**
 );
 SQLITE_API int sqlite3_aiik_descriptor_inspect(
   sqlite3*, sqlite3_aiik_descriptor_info*
 );
-SQLITE_API int sqlite3_aiik_descriptor_test_forbidden_open(void);
+#ifdef SQLITE_AIIK_DESCRIPTOR_VFS_TEST
+SQLITE_API int sqlite3_aiik_descriptor_test_forbidden_open(sqlite3*);
 SQLITE_API void sqlite3_aiik_descriptor_test_inject_early_failure(int);
 SQLITE_API int sqlite3_aiik_descriptor_test_outstanding_duplicates(void);
 SQLITE_API int sqlite3_aiik_descriptor_test_consume_wal(sqlite3*);
@@ -7985,6 +7995,7 @@ SQLITE_API int sqlite3_aiik_descriptor_test_adopt_shm(sqlite3*);
 SQLITE_API int sqlite3_aiik_descriptor_test_mismatch_shm(sqlite3*);
 SQLITE_API int sqlite3_aiik_descriptor_test_hold_stock_shm(sqlite3*);
 SQLITE_API int sqlite3_aiik_descriptor_test_release_stock_shm(sqlite3*);
+#endif /* SQLITE_AIIK_DESCRIPTOR_VFS_TEST */
 #endif /* SQLITE_AIIK_DESCRIPTOR_VFS */
 
 /*
