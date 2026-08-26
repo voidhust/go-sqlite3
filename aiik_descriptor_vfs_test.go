@@ -3,9 +3,45 @@
 package sqlite3
 
 import (
+	"database/sql/driver"
 	"os"
+	"path/filepath"
+	"syscall"
 	"testing"
 )
+
+func aiikTestDescriptorFile(t *testing.T, file *os.File) AIIKDescriptorFile {
+	t.Helper()
+	var st syscall.Stat_t
+	if err := syscall.Fstat(int(file.Fd()), &st); err != nil {
+		t.Fatal(err)
+	}
+	return AIIKDescriptorFile{
+		FD:        int(file.Fd()),
+		Device:    uint64(st.Dev),
+		Inode:     uint64(st.Ino),
+		LinkCount: uint64(st.Nlink),
+		FileType:  uint32(st.Mode & syscall.S_IFMT),
+	}
+}
+
+func aiikTestDatabaseFile(t *testing.T, dir, name string) *os.File {
+	t.Helper()
+	path := filepath.Join(dir, name)
+	conn, err := (&SQLiteDriver{}).Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := conn.Close(); err != nil {
+		t.Fatal(err)
+	}
+	file, err := os.OpenFile(path, os.O_RDWR, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = file.Close() })
+	return file
+}
 
 func TestAIIKDescriptorVFSRejectsMissingSourceSidecars(t *testing.T) {
 	db, err := os.CreateTemp(t.TempDir(), "source-*.db")
@@ -17,6 +53,156 @@ func TestAIIKDescriptorVFSRejectsMissingSourceSidecars(t *testing.T) {
 	_, err = OpenAIIKDescriptorSource(AIIKDescriptorSource{Database: AIIKDescriptorFile{FD: int(db.Fd())}})
 	if err == nil {
 		t.Fatal("OpenAIIKDescriptorSource accepted missing WAL and SHM descriptors")
+	}
+}
+
+func TestAIIKDescriptorVFSRequiresEveryExactIdentityField(t *testing.T) {
+	db := aiikTestDatabaseFile(t, t.TempDir(), "source.db")
+	file := aiikTestDescriptorFile(t, db)
+	file.Inode = 0
+
+	_, err := OpenAIIKDescriptorDestination(AIIKDescriptorDestination{Database: file})
+	if err == nil {
+		t.Fatal("OpenAIIKDescriptorDestination accepted a zero exact identity field")
+	}
+}
+
+func TestAIIKDescriptorVFSOpensExactSourceThroughPrivateVFS(t *testing.T) {
+	dir := t.TempDir()
+	db := aiikTestDatabaseFile(t, dir, "source.db")
+	wal, err := os.Create(filepath.Join(dir, "source.db-wal"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = wal.Close() })
+	shm, err := os.Create(filepath.Join(dir, "source.db-shm"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = shm.Close() })
+
+	conn, err := OpenAIIKDescriptorSource(AIIKDescriptorSource{
+		Database: aiikTestDescriptorFile(t, db),
+		WAL:      aiikTestDescriptorFile(t, wal),
+		SHM:      aiikTestDescriptorFile(t, shm),
+	})
+	if err != nil {
+		t.Fatalf("OpenAIIKDescriptorSource() error = %v", err)
+	}
+	t.Cleanup(func() { _ = conn.Close() })
+	info, err := InspectAIIKUnixConnection(conn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !info.DescriptorVFS {
+		t.Fatal("source did not reach the private descriptor VFS")
+	}
+
+	if _, err := OpenAIIKDescriptorSource(AIIKDescriptorSource{
+		Database: aiikTestDescriptorFile(t, db),
+		WAL:      aiikTestDescriptorFile(t, wal),
+		SHM:      aiikTestDescriptorFile(t, shm),
+	}); err == nil {
+		t.Fatal("OpenAIIKDescriptorSource accepted a duplicate live endpoint use")
+	}
+}
+
+func TestAIIKDescriptorVFSOpensExactDestinationThroughPrivateVFS(t *testing.T) {
+	db := aiikTestDatabaseFile(t, t.TempDir(), "destination.db")
+	conn, err := OpenAIIKDescriptorDestination(AIIKDescriptorDestination{
+		Database: aiikTestDescriptorFile(t, db),
+	})
+	if err != nil {
+		t.Fatalf("OpenAIIKDescriptorDestination() error = %v", err)
+	}
+	t.Cleanup(func() { _ = conn.Close() })
+	info, err := InspectAIIKUnixConnection(conn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !info.DescriptorVFS {
+		t.Fatal("destination did not reach the private descriptor VFS")
+	}
+	if _, err := OpenAIIKDescriptorDestination(AIIKDescriptorDestination{
+		Database: aiikTestDescriptorFile(t, db),
+	}); err == nil {
+		t.Fatal("OpenAIIKDescriptorDestination accepted a duplicate live endpoint use")
+	}
+}
+
+func TestAIIKDescriptorVFSSourceRejectsWritesBeforeMutation(t *testing.T) {
+	dir := t.TempDir()
+	db := aiikTestDatabaseFile(t, dir, "source.db")
+	wal, err := os.Create(filepath.Join(dir, "source.db-wal"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = wal.Close() })
+	shm, err := os.Create(filepath.Join(dir, "source.db-shm"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = shm.Close() })
+	conn, err := OpenAIIKDescriptorSource(AIIKDescriptorSource{
+		Database: aiikTestDescriptorFile(t, db),
+		WAL:      aiikTestDescriptorFile(t, wal),
+		SHM:      aiikTestDescriptorFile(t, shm),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = conn.Close() })
+	if _, err := conn.Exec("PRAGMA journal_mode=OFF; CREATE TABLE forbidden_write (id INTEGER)", nil); err == nil {
+		t.Fatal("descriptor source accepted a direct database write")
+	}
+}
+
+func TestAIIKDescriptorVFSDoesNotChangeDefaultDriverOpen(t *testing.T) {
+	conn, err := (&SQLiteDriver{}).Open(filepath.Join(t.TempDir(), "ordinary.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = conn.Close() })
+	if _, ok := conn.(driver.Conn); !ok {
+		t.Fatal("ordinary SQLiteDriver.Open did not return a driver connection")
+	}
+}
+
+func TestAIIKDescriptorVFSRejectsForbiddenRoleBeforePathOpen(t *testing.T) {
+	if aiikTestForbiddenOpen() == nil {
+		t.Fatal("private descriptor VFS accepted a temporary database role")
+	}
+	if outstanding := aiikTestOutstandingDuplicates(); outstanding != 0 {
+		t.Fatalf("forbidden role retained %d duplicated descriptors", outstanding)
+	}
+}
+
+func TestAIIKDescriptorVFSEarlyOpenFailureClosesAllDuplicates(t *testing.T) {
+	dir := t.TempDir()
+	db := aiikTestDatabaseFile(t, dir, "source.db")
+	wal, err := os.Create(filepath.Join(dir, "source.db-wal"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = wal.Close() })
+	shm, err := os.Create(filepath.Join(dir, "source.db-shm"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = shm.Close() })
+	aiikTestInjectEarlyFailure(true)
+	t.Cleanup(func() { aiikTestInjectEarlyFailure(false) })
+
+	_, err = OpenAIIKDescriptorSource(AIIKDescriptorSource{
+		Database: aiikTestDescriptorFile(t, db),
+		WAL:      aiikTestDescriptorFile(t, wal),
+		SHM:      aiikTestDescriptorFile(t, shm),
+	})
+	if err == nil {
+		t.Fatal("injected private VFS early failure unexpectedly opened source")
+	}
+	if outstanding := aiikTestOutstandingDuplicates(); outstanding != 0 {
+		t.Fatalf("early failure leaked %d duplicated descriptors", outstanding)
 	}
 }
 

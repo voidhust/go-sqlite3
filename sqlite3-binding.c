@@ -38201,10 +38201,58 @@ SQLITE_PRIVATE int sqlite3KvvfsInit(void){
 #define IS_LOCK_ERROR(x)  ((x != SQLITE_OK) && (x != SQLITE_BUSY))
 
 /* Forward references */
+typedef struct unixFile unixFile;
 typedef struct unixShm unixShm;               /* Connection shared memory */
 typedef struct unixShmNode unixShmNode;       /* Shared memory instance */
 typedef struct unixInodeInfo unixInodeInfo;   /* An i-node */
 typedef struct UnixUnusedFd UnixUnusedFd;     /* An unused file descriptor */
+typedef struct AIIKDescriptorBinding AIIKDescriptorBinding;
+typedef struct sqlite3_aiik_descriptor_file sqlite3_aiik_descriptor_file;
+struct sqlite3_aiik_descriptor_file {
+  int fd;
+  sqlite3_uint64 device;
+  sqlite3_uint64 inode;
+  sqlite3_uint64 link_count;
+  unsigned int file_type;
+};
+typedef struct sqlite3_aiik_descriptor_info sqlite3_aiik_descriptor_info;
+struct sqlite3_aiik_descriptor_info {
+  int descriptor_vfs;
+  sqlite3_uint64 device;
+  sqlite3_uint64 inode;
+  sqlite3_uint64 link_count;
+  unsigned int file_type;
+  unsigned int filesystem;
+  unsigned int locking_method;
+};
+SQLITE_API int sqlite3_aiik_descriptor_validate(
+  const sqlite3_aiik_descriptor_file*, int
+);
+#define AIIK_DESCRIPTOR_DB   0
+#define AIIK_DESCRIPTOR_WAL  1
+#define AIIK_DESCRIPTOR_SHM  2
+#define AIIK_DESCRIPTOR_SOURCE 1
+#define AIIK_DESCRIPTOR_DESTINATION 2
+struct AIIKDescriptorBinding {
+  AIIKDescriptorBinding *pNext;
+  int eKind;
+  int aFd[3];
+  struct stat aStat[3];
+  int nRef;
+  int bMainClosed;
+  int bOnList;
+  char zToken[48];
+};
+static sqlite3_mutex *aiikDescriptorMutex = 0;
+static int aiikDescriptorOutstandingDuplicates = 0;
+static int aiikDescriptorInjectEarlyFailure = 0;
+static int aiikDescriptorSameFile(
+  const struct stat *a, const struct stat *b
+){
+  return a->st_dev==b->st_dev && a->st_ino==b->st_ino
+      && (a->st_mode&S_IFMT)==(b->st_mode&S_IFMT);
+}
+static void aiikDescriptorFileClosed(unixFile*);
 
 /*
 ** Sometimes, after a file handle is closed by SQLite, the file descriptor
@@ -38222,7 +38270,6 @@ struct UnixUnusedFd {
 ** The unixFile structure is subclass of sqlite3_file specific to the unix
 ** VFS implementations.
 */
-typedef struct unixFile unixFile;
 struct unixFile {
   sqlite3_io_methods const *pMethod;  /* Always the first entry */
   sqlite3_vfs *pVfs;                  /* The VFS that created this unixFile */
@@ -38245,6 +38292,8 @@ struct unixFile {
 #endif
   int sectorSize;                     /* Device sector size */
   int deviceCharacteristics;          /* Precomputed device characteristics */
+  AIIKDescriptorBinding *pAIIKBinding;/* Private descriptor-VFS binding */
+  unsigned char eAIIKRole;            /* Private descriptor-VFS file role */
 #if SQLITE_ENABLE_LOCKING_STYLE
   int openFlags;                      /* The flags specified at open() */
 #endif
@@ -40112,6 +40161,7 @@ static int closeUnixFile(sqlite3_file *id){
     robust_close(pFile, pFile->h, __LINE__);
     pFile->h = -1;
   }
+  aiikDescriptorFileClosed(pFile);
 #if OS_VXWORKS
   if( pFile->pId ){
     if( pFile->ctrlFlags & UNIXFILE_DELETE ){
@@ -42307,6 +42357,7 @@ struct unixShmNode {
   sqlite3_mutex *pShmMutex;  /* Mutex to access this object */
   char *zFilename;           /* Name of the mmapped file */
   int hShm;                  /* Open file descriptor */
+  AIIKDescriptorBinding *pAIIKBinding; /* Private descriptor SHM owner */
   int szRegion;              /* Size of shared-memory regions */
   u16 nRegion;               /* Size of array apRegion */
   u8 isReadonly;             /* True if read-only */
@@ -42522,6 +42573,10 @@ static void unixShmPurge(unixFile *pFd){
     if( p->hShm>=0 ){
       robust_close(pFd, p->hShm, __LINE__);
       p->hShm = -1;
+      if( p->pAIIKBinding ){
+        aiikDescriptorOutstandingDuplicates--;
+        p->pAIIKBinding = 0;
+      }
     }
     p->pInode->pShmNode = 0;
     sqlite3_free(p);
@@ -42675,6 +42730,59 @@ static int unixOpenSharedMemory(unixFile *pDbFd){
       goto shm_open_err;
     }
 
+    if( pDbFd->pAIIKBinding ){
+      AIIKDescriptorBinding *pBinding = pDbFd->pAIIKBinding;
+      if( pBinding->eKind!=AIIK_DESCRIPTOR_SOURCE ){
+        rc = SQLITE_CANTOPEN_BKPT;
+        goto shm_open_err;
+      }
+      nShmFilename = (int)strlen("aiik-descriptor-shm") + 1;
+      pShmNode = sqlite3_malloc64( sizeof(*pShmNode) + nShmFilename );
+      if( pShmNode==0 ){
+        rc = SQLITE_NOMEM_BKPT;
+        goto shm_open_err;
+      }
+      memset(pShmNode, 0, sizeof(*pShmNode)+nShmFilename);
+      zShm = pShmNode->zFilename = (char*)&pShmNode[1];
+      memcpy(zShm, "aiik-descriptor-shm", nShmFilename);
+      sqlite3_mutex_enter(aiikDescriptorMutex);
+      if( pBinding->aFd[AIIK_DESCRIPTOR_SHM]<0 ){
+        sqlite3_mutex_leave(aiikDescriptorMutex);
+        sqlite3_free(pShmNode);
+        rc = SQLITE_CANTOPEN_BKPT;
+        goto shm_open_err;
+      }
+      pShmNode->hShm = pBinding->aFd[AIIK_DESCRIPTOR_SHM];
+      pBinding->aFd[AIIK_DESCRIPTOR_SHM] = -1;
+      pShmNode->pAIIKBinding = pBinding;
+      sqlite3_mutex_leave(aiikDescriptorMutex);
+      pDbFd->pInode->pShmNode = pShmNode;
+      pShmNode->pInode = pDbFd->pInode;
+      if( sqlite3GlobalConfig.bCoreMutex ){
+        pShmNode->pShmMutex = sqlite3_mutex_alloc(SQLITE_MUTEX_FAST);
+        if( pShmNode->pShmMutex==0 ){
+          rc = SQLITE_NOMEM_BKPT;
+          goto shm_open_err;
+        }
+#ifdef SQLITE_ENABLE_SETLK_TIMEOUT
+        {
+          int ii;
+          for(ii=0; ii<SQLITE_SHM_NLOCK; ii++){
+            pShmNode->aMutex[ii] = sqlite3_mutex_alloc(SQLITE_MUTEX_FAST);
+            if( pShmNode->aMutex[ii]==0 ){
+              rc = SQLITE_NOMEM_BKPT;
+              goto shm_open_err;
+            }
+          }
+        }
+#endif
+      }
+      if( pInode->bProcessLock==0 ){
+        rc = unixLockSharedMemory(pDbFd, pShmNode);
+        if( rc!=SQLITE_OK && rc!=SQLITE_READONLY_CANTINIT ) goto shm_open_err;
+      }
+    }else{
+
 #ifdef SQLITE_SHM_DIRECTORY
     nShmFilename = sizeof(SQLITE_SHM_DIRECTORY) + 31;
 #else
@@ -42742,6 +42850,28 @@ static int unixOpenSharedMemory(unixFile *pDbFd){
       rc = unixLockSharedMemory(pDbFd, pShmNode);
       if( rc!=SQLITE_OK && rc!=SQLITE_READONLY_CANTINIT ) goto shm_open_err;
     }
+    }
+  }else if( pDbFd->pAIIKBinding ){
+    AIIKDescriptorBinding *pBinding = pDbFd->pAIIKBinding;
+    struct stat shmStat;
+    if( pBinding->eKind!=AIIK_DESCRIPTOR_SOURCE ){
+      rc = SQLITE_CANTOPEN_BKPT;
+      goto shm_open_err;
+    }
+    sqlite3_mutex_enter(aiikDescriptorMutex);
+    if( pBinding->aFd[AIIK_DESCRIPTOR_SHM]<0
+     || osFstat(pShmNode->hShm, &shmStat)!=0
+     || !aiikDescriptorSameFile(&shmStat,
+                                &pBinding->aStat[AIIK_DESCRIPTOR_SHM])
+    ){
+      sqlite3_mutex_leave(aiikDescriptorMutex);
+      rc = SQLITE_CANTOPEN_BKPT;
+      goto shm_open_err;
+    }
+    close(pBinding->aFd[AIIK_DESCRIPTOR_SHM]);
+    aiikDescriptorOutstandingDuplicates--;
+    pBinding->aFd[AIIK_DESCRIPTOR_SHM] = -1;
+    sqlite3_mutex_leave(aiikDescriptorMutex);
   }
 
   /* Make the new connection a child of the unixShmNode */
@@ -44490,6 +44620,346 @@ open_finished:
   return rc;
 }
 
+/*
+** AIIK's descriptor VFS is intentionally private to this amalgamation.  A
+** binding is a one-use, process-local capability: it owns duplicate file
+** descriptors until the stock unix file/shm machinery adopts them.  The
+** token is an internal dispatch key only; it is never accepted from a DSN.
+*/
+static AIIKDescriptorBinding *aiikDescriptorList = 0;
+static sqlite3_vfs aiikDescriptorVfs;
+static sqlite3_io_methods aiikDescriptorSourcePosixMethods;
+static sqlite3_io_methods aiikDescriptorSourceNoLockMethods;
+static int aiikDescriptorSourceMethodsReady = 0;
+
+static int aiikDescriptorSourceWrite(
+  sqlite3_file *id, const void *pBuf, int amt, sqlite3_int64 offset
+){
+  UNUSED_PARAMETER(id);
+  UNUSED_PARAMETER(pBuf);
+  UNUSED_PARAMETER(amt);
+  UNUSED_PARAMETER(offset);
+  return SQLITE_READONLY;
+}
+
+static int aiikDescriptorSourceTruncate(sqlite3_file *id, sqlite3_int64 size){
+  UNUSED_PARAMETER(id);
+  UNUSED_PARAMETER(size);
+  return SQLITE_READONLY;
+}
+
+static int aiikDescriptorSourceSync(sqlite3_file *id, int flags){
+  UNUSED_PARAMETER(id);
+  UNUSED_PARAMETER(flags);
+  return SQLITE_READONLY;
+}
+
+static void aiikDescriptorSourceMethodsInit(void){
+  if( aiikDescriptorSourceMethodsReady ) return;
+  memcpy(&aiikDescriptorSourcePosixMethods, &posixIoMethods,
+         sizeof(aiikDescriptorSourcePosixMethods));
+  memcpy(&aiikDescriptorSourceNoLockMethods, &nolockIoMethods,
+         sizeof(aiikDescriptorSourceNoLockMethods));
+  aiikDescriptorSourcePosixMethods.xWrite = aiikDescriptorSourceWrite;
+  aiikDescriptorSourcePosixMethods.xTruncate = aiikDescriptorSourceTruncate;
+  aiikDescriptorSourcePosixMethods.xSync = aiikDescriptorSourceSync;
+  aiikDescriptorSourceNoLockMethods.xWrite = aiikDescriptorSourceWrite;
+  aiikDescriptorSourceNoLockMethods.xTruncate = aiikDescriptorSourceTruncate;
+  aiikDescriptorSourceNoLockMethods.xSync = aiikDescriptorSourceSync;
+  aiikDescriptorSourceMethodsReady = 1;
+}
+
+static int aiikDescriptorMutexInit(void){
+  sqlite3_mutex *pMaster;
+  if( aiikDescriptorMutex ) return SQLITE_OK;
+  pMaster = sqlite3MutexAlloc(SQLITE_MUTEX_STATIC_MASTER);
+  sqlite3_mutex_enter(pMaster);
+  if( aiikDescriptorMutex==0 ){
+    aiikDescriptorMutex = sqlite3_mutex_alloc(SQLITE_MUTEX_FAST);
+  }
+  sqlite3_mutex_leave(pMaster);
+  return aiikDescriptorMutex ? SQLITE_OK : SQLITE_NOMEM_BKPT;
+}
+
+static void aiikDescriptorCloseUnused(AIIKDescriptorBinding *p){
+  int i;
+  for(i=0; i<3; i++){
+    if( p->aFd[i]>=0 ){
+      close(p->aFd[i]);
+      aiikDescriptorOutstandingDuplicates--;
+      p->aFd[i] = -1;
+    }
+  }
+}
+
+static void aiikDescriptorUnlink(AIIKDescriptorBinding *p){
+  AIIKDescriptorBinding **pp;
+  if( !p->bOnList ) return;
+  for(pp=&aiikDescriptorList; *pp && *pp!=p; pp=&(*pp)->pNext){}
+  if( *pp==p ) *pp = p->pNext;
+  p->pNext = 0;
+  p->bOnList = 0;
+}
+
+static void aiikDescriptorFree(AIIKDescriptorBinding *p){
+  aiikDescriptorCloseUnused(p);
+  sqlite3_free(p);
+}
+
+static int aiikDescriptorIsInUse(const struct stat *pStat){
+  AIIKDescriptorBinding *p;
+  int i;
+  for(p=aiikDescriptorList; p; p=p->pNext){
+    for(i=0; i<3; i++){
+      if( p->aStat[i].st_ino!=0
+       && aiikDescriptorSameFile(pStat, &p->aStat[i]) ){
+        return 1;
+      }
+    }
+  }
+  return 0;
+}
+
+static AIIKDescriptorBinding *aiikDescriptorFind(
+  const char *zPath, int *peRole
+){
+  AIIKDescriptorBinding *p;
+  for(p=aiikDescriptorList; p; p=p->pNext){
+    int n = (int)strlen(p->zToken);
+    if( strncmp(zPath, p->zToken, n)==0 ){
+      if( zPath[n]==0 ){
+        *peRole = AIIK_DESCRIPTOR_DB;
+        return p;
+      }
+      if( strcmp(&zPath[n], "-wal")==0 ){
+        *peRole = AIIK_DESCRIPTOR_WAL;
+        return p;
+      }
+    }
+  }
+  return 0;
+}
+
+static void aiikDescriptorOpenFailed(AIIKDescriptorBinding *p, int eRole){
+  int bFree = 0;
+  sqlite3_mutex_enter(aiikDescriptorMutex);
+  aiikDescriptorOutstandingDuplicates--;
+  p->nRef--;
+  if( eRole==AIIK_DESCRIPTOR_DB ){
+    p->bMainClosed = 1;
+    aiikDescriptorUnlink(p);
+    aiikDescriptorCloseUnused(p);
+  }
+  if( p->bMainClosed && p->nRef==0 ) bFree = 1;
+  sqlite3_mutex_leave(aiikDescriptorMutex);
+  if( bFree ) aiikDescriptorFree(p);
+}
+
+static void aiikDescriptorFileClosed(unixFile *pFile){
+  AIIKDescriptorBinding *p = pFile->pAIIKBinding;
+  int bFree = 0;
+  if( p==0 ) return;
+  sqlite3_mutex_enter(aiikDescriptorMutex);
+  if( pFile->eAIIKRole==AIIK_DESCRIPTOR_DB ){
+    p->bMainClosed = 1;
+    aiikDescriptorUnlink(p);
+    aiikDescriptorCloseUnused(p);
+  }
+  aiikDescriptorOutstandingDuplicates--;
+  p->nRef--;
+  if( p->bMainClosed && p->nRef==0 ) bFree = 1;
+  sqlite3_mutex_leave(aiikDescriptorMutex);
+  if( bFree ) aiikDescriptorFree(p);
+}
+
+static int aiikDescriptorRejectDelete(
+  sqlite3_vfs *NotUsed, const char *zPath, int syncDir
+){
+  UNUSED_PARAMETER(NotUsed);
+  UNUSED_PARAMETER(zPath);
+  UNUSED_PARAMETER(syncDir);
+  return SQLITE_IOERR_DELETE;
+}
+
+static int aiikDescriptorAccess(
+  sqlite3_vfs *NotUsed, const char *zPath, int flags, int *pResOut
+){
+  UNUSED_PARAMETER(NotUsed);
+  UNUSED_PARAMETER(zPath);
+  UNUSED_PARAMETER(flags);
+  *pResOut = 0;
+  return SQLITE_OK;
+}
+
+static int aiikDescriptorFullPathname(
+  sqlite3_vfs *NotUsed, const char *zPath, int nOut, char *zOut
+){
+  int n;
+  UNUSED_PARAMETER(NotUsed);
+  if( zPath==0 ) return SQLITE_CANTOPEN_BKPT;
+  n = (int)strlen(zPath);
+  if( n+1>nOut ) return SQLITE_CANTOPEN_BKPT;
+  memcpy(zOut, zPath, n+1);
+  return SQLITE_OK;
+}
+
+static int aiikDescriptorVfsOpen(
+  sqlite3_vfs *pVfs, const char *zPath, sqlite3_file *pFile,
+  int flags, int *pOutFlags
+){
+  AIIKDescriptorBinding *pBinding;
+  unixFile *pUnix = (unixFile*)pFile;
+  int eRole = -1;
+  int eType = flags&0x0fff00;
+  int fd;
+  int rc;
+  if( zPath==0 || (flags&(SQLITE_OPEN_CREATE|SQLITE_OPEN_EXCLUSIVE|
+                    SQLITE_OPEN_DELETEONCLOSE))!=0 ) return SQLITE_CANTOPEN_BKPT;
+  sqlite3_mutex_enter(aiikDescriptorMutex);
+  pBinding = aiikDescriptorFind(zPath, &eRole);
+  if( pBinding==0
+   || (eRole==AIIK_DESCRIPTOR_DB && eType!=SQLITE_OPEN_MAIN_DB)
+   || (eRole==AIIK_DESCRIPTOR_WAL && eType!=SQLITE_OPEN_WAL)
+   || (eRole==AIIK_DESCRIPTOR_WAL && pBinding->eKind!=AIIK_DESCRIPTOR_SOURCE)
+   || pBinding->aFd[eRole]<0
+  ){
+    sqlite3_mutex_leave(aiikDescriptorMutex);
+    return SQLITE_CANTOPEN_BKPT;
+  }
+  fd = pBinding->aFd[eRole];
+  pBinding->aFd[eRole] = -1;
+  pBinding->nRef++;
+  sqlite3_mutex_leave(aiikDescriptorMutex);
+
+  if( aiikDescriptorInjectEarlyFailure ){
+    close(fd);
+    aiikDescriptorOpenFailed(pBinding, eRole);
+    return SQLITE_IOERR;
+  }
+  rc = fillInUnixFile(
+      pVfs, fd, pFile, zPath,
+      eRole==AIIK_DESCRIPTOR_WAL ? UNIXFILE_NOLOCK : 0
+  );
+  if( rc!=SQLITE_OK ){
+    aiikDescriptorOpenFailed(pBinding, eRole);
+    return rc;
+  }
+  pUnix->pAIIKBinding = pBinding;
+  pUnix->eAIIKRole = (unsigned char)eRole;
+  if( pBinding->eKind==AIIK_DESCRIPTOR_SOURCE ){
+    sqlite3_mutex_enter(aiikDescriptorMutex);
+    aiikDescriptorSourceMethodsInit();
+    pUnix->pMethod = eRole==AIIK_DESCRIPTOR_DB
+        ? &aiikDescriptorSourcePosixMethods
+        : &aiikDescriptorSourceNoLockMethods;
+    sqlite3_mutex_leave(aiikDescriptorMutex);
+  }
+  if( pOutFlags ) *pOutFlags = flags;
+  return SQLITE_OK;
+}
+
+static int aiikDescriptorRegister(
+  const sqlite3_aiik_descriptor_file *aFile, int eKind,
+  AIIKDescriptorBinding **ppBinding
+){
+  AIIKDescriptorBinding *p;
+  int nFile = eKind==AIIK_DESCRIPTOR_SOURCE ? 3 : 1;
+  int i, rc;
+  unsigned char aRandom[16];
+  static const char zHex[] = "0123456789abcdef";
+
+  rc = aiikDescriptorMutexInit();
+  if( rc!=SQLITE_OK ) return rc;
+  p = sqlite3_malloc64(sizeof(*p));
+  if( p==0 ) return SQLITE_NOMEM_BKPT;
+  memset(p, 0, sizeof(*p));
+  p->eKind = eKind;
+  for(i=0; i<3; i++) p->aFd[i] = -1;
+  for(i=0; i<nFile; i++){
+    rc = sqlite3_aiik_descriptor_validate(&aFile[i], 1);
+    if( rc!=SQLITE_OK ) goto register_fail;
+    p->aFd[i] = dup(aFile[i].fd);
+    if( p->aFd[i]<0 ){
+      rc = SQLITE_IOERR_FSTAT;
+      goto register_fail;
+    }
+    aiikDescriptorOutstandingDuplicates++;
+    if( osFstat(p->aFd[i], &p->aStat[i])!=0 ){
+      rc = SQLITE_IOERR_FSTAT;
+      goto register_fail;
+    }
+    if( (fcntl(p->aFd[i], F_GETFL)&O_ACCMODE)!=O_RDWR ){
+      rc = SQLITE_READONLY;
+      goto register_fail;
+    }
+#if defined(__APPLE__)
+    {
+      struct statfs fsInfo;
+      if( fstatfs(p->aFd[i], &fsInfo)!=0
+       || !(fsInfo.f_flags&MNT_LOCAL)
+       || strncmp(fsInfo.f_fstypename, "apfs", 5)!=0
+      ){
+        rc = SQLITE_CANTOPEN_BKPT;
+        goto register_fail;
+      }
+    }
+#endif
+  }
+  for(i=0; i<nFile; i++){
+    int j;
+    for(j=0; j<i; j++){
+      if( aiikDescriptorSameFile(&p->aStat[i], &p->aStat[j]) ){
+        rc = SQLITE_MISMATCH;
+        goto register_fail;
+      }
+    }
+  }
+  sqlite3_randomness(sizeof(aRandom), aRandom);
+  memcpy(p->zToken, "aiik-desc-", 10);
+  for(i=0; i<16; i++){
+    p->zToken[10+i*2] = zHex[aRandom[i]>>4];
+    p->zToken[11+i*2] = zHex[aRandom[i]&0x0f];
+  }
+  p->zToken[42] = 0;
+  p->nRef = 1;  /* Held by the sqlite3_open_v2 caller. */
+  sqlite3_mutex_enter(aiikDescriptorMutex);
+  for(i=0; i<nFile; i++){
+    if( aiikDescriptorIsInUse(&p->aStat[i]) ){
+      sqlite3_mutex_leave(aiikDescriptorMutex);
+      rc = SQLITE_BUSY;
+      goto register_fail;
+    }
+  }
+  p->pNext = aiikDescriptorList;
+  aiikDescriptorList = p;
+  p->bOnList = 1;
+  sqlite3_mutex_leave(aiikDescriptorMutex);
+  *ppBinding = p;
+  return SQLITE_OK;
+
+register_fail:
+  aiikDescriptorFree(p);
+  return rc;
+}
+
+static void aiikDescriptorReleaseOpen(AIIKDescriptorBinding *p){
+  int bFree = 0;
+  sqlite3_mutex_enter(aiikDescriptorMutex);
+  p->nRef--;
+  if( p->bMainClosed && p->nRef==0 ) bFree = 1;
+  sqlite3_mutex_leave(aiikDescriptorMutex);
+  if( bFree ) aiikDescriptorFree(p);
+}
+
+static void aiikDescriptorAbort(AIIKDescriptorBinding *p){
+  sqlite3_mutex_enter(aiikDescriptorMutex);
+  p->bMainClosed = 1;
+  aiikDescriptorUnlink(p);
+  aiikDescriptorCloseUnused(p);
+  sqlite3_mutex_leave(aiikDescriptorMutex);
+  aiikDescriptorReleaseOpen(p);
+}
+
 
 /*
 ** Delete the file at zPath. If the dirSync argument is true, fsync()
@@ -46204,6 +46674,14 @@ SQLITE_API int sqlite3_os_init(void){
     sqlite3_vfs_register(&aVfs[i], i==0);
 #endif
   }
+  aiikDescriptorVfs = aVfs[0];
+  aiikDescriptorVfs.zName = "aiik-descriptor-unix";
+  aiikDescriptorVfs.pAppData = (void*)&posixIoFinder;
+  aiikDescriptorVfs.xOpen = aiikDescriptorVfsOpen;
+  aiikDescriptorVfs.xDelete = aiikDescriptorRejectDelete;
+  aiikDescriptorVfs.xAccess = aiikDescriptorAccess;
+  aiikDescriptorVfs.xFullPathname = aiikDescriptorFullPathname;
+  sqlite3_vfs_register(&aiikDescriptorVfs, 0);
 #ifdef SQLITE_OS_KV_OPTIONAL
   sqlite3KvvfsInit();
 #endif
@@ -46246,21 +46724,15 @@ SQLITE_API int sqlite3_os_end(void){
 }
 
 /* AIIK descriptor-VFS private fork boundary; see sqlite3-binding.h. */
-typedef struct sqlite3_aiik_descriptor_file sqlite3_aiik_descriptor_file;
-struct sqlite3_aiik_descriptor_file {
-  int fd;
-  sqlite3_uint64 device;
-  sqlite3_uint64 inode;
-  sqlite3_uint64 link_count;
-  unsigned int file_type;
-};
 SQLITE_API int sqlite3_aiik_descriptor_validate(
   const sqlite3_aiik_descriptor_file *pExpected,
   int requireRegular
 ){
   struct stat st;
   int ownedFd;
-  if( pExpected==0 || pExpected->fd<0 ) return SQLITE_MISUSE_BKPT;
+  if( pExpected==0 || pExpected->fd<0 || pExpected->device==0
+   || pExpected->inode==0 || pExpected->link_count==0
+   || pExpected->file_type==0 ) return SQLITE_MISUSE_BKPT;
   ownedFd = dup(pExpected->fd);
   if( ownedFd<0 ) return SQLITE_IOERR_FSTAT;
   if( osFstat(ownedFd, &st)!=0 ){
@@ -46269,20 +46741,91 @@ SQLITE_API int sqlite3_aiik_descriptor_validate(
   }
   close(ownedFd);
   if( requireRegular && !S_ISREG(st.st_mode) ) return SQLITE_MISMATCH;
-  if( pExpected->device!=0 && pExpected->device!=(sqlite3_uint64)st.st_dev ){
+  if( pExpected->device!=(sqlite3_uint64)st.st_dev ){
     return SQLITE_MISMATCH;
   }
-  if( pExpected->inode!=0 && pExpected->inode!=(sqlite3_uint64)st.st_ino ){
+  if( pExpected->inode!=(sqlite3_uint64)st.st_ino ){
     return SQLITE_MISMATCH;
   }
-  if( pExpected->link_count!=0 && pExpected->link_count!=(sqlite3_uint64)st.st_nlink ){
+  if( pExpected->link_count!=(sqlite3_uint64)st.st_nlink ){
     return SQLITE_MISMATCH;
   }
-  if( pExpected->file_type!=0
-   && pExpected->file_type!=(unsigned int)(st.st_mode&S_IFMT) ){
+  if( pExpected->file_type!=(unsigned int)(st.st_mode&S_IFMT) ){
     return SQLITE_MISMATCH;
   }
   return SQLITE_OK;
+}
+
+SQLITE_API int sqlite3_aiik_descriptor_open(
+  const sqlite3_aiik_descriptor_file *aFile, int eKind, sqlite3 **ppDb
+){
+  AIIKDescriptorBinding *pBinding = 0;
+  sqlite3 *db = 0;
+  int rc;
+  if( ppDb==0 || aFile==0
+   || (eKind!=AIIK_DESCRIPTOR_SOURCE && eKind!=AIIK_DESCRIPTOR_DESTINATION)
+  ) return SQLITE_MISUSE_BKPT;
+  *ppDb = 0;
+  rc = sqlite3_initialize();
+  if( rc!=SQLITE_OK ) return rc;
+  rc = aiikDescriptorRegister(aFile, eKind, &pBinding);
+  if( rc!=SQLITE_OK ) return rc;
+  rc = sqlite3_open_v2(
+      pBinding->zToken, &db,
+      SQLITE_OPEN_READWRITE|SQLITE_OPEN_FULLMUTEX|SQLITE_OPEN_PRIVATECACHE,
+      "aiik-descriptor-unix"
+  );
+  if( rc!=SQLITE_OK ){
+    if( db ) sqlite3_close_v2(db);
+    aiikDescriptorAbort(pBinding);
+    return rc;
+  }
+  aiikDescriptorReleaseOpen(pBinding);
+  *ppDb = db;
+  return SQLITE_OK;
+}
+
+SQLITE_API int sqlite3_aiik_descriptor_inspect(
+  sqlite3 *db, sqlite3_aiik_descriptor_info *pInfo
+){
+  sqlite3_file *pFile = 0;
+  unixFile *pUnix;
+  AIIKDescriptorBinding *pBinding;
+  if( db==0 || pInfo==0 ) return SQLITE_MISUSE_BKPT;
+  memset(pInfo, 0, sizeof(*pInfo));
+  if( sqlite3_file_control(db, "main", SQLITE_FCNTL_FILE_POINTER, &pFile)
+      !=SQLITE_OK || pFile==0 ) return SQLITE_MISUSE_BKPT;
+  pUnix = (unixFile*)pFile;
+  pBinding = pUnix->pAIIKBinding;
+  if( pUnix->pVfs!=&aiikDescriptorVfs || pBinding==0 ) return SQLITE_MISUSE_BKPT;
+  pInfo->descriptor_vfs = 1;
+  pInfo->device = (sqlite3_uint64)pBinding->aStat[AIIK_DESCRIPTOR_DB].st_dev;
+  pInfo->inode = (sqlite3_uint64)pBinding->aStat[AIIK_DESCRIPTOR_DB].st_ino;
+  pInfo->link_count = (sqlite3_uint64)pBinding->aStat[AIIK_DESCRIPTOR_DB].st_nlink;
+  pInfo->file_type = (unsigned int)(pBinding->aStat[AIIK_DESCRIPTOR_DB].st_mode&S_IFMT);
+  pInfo->filesystem = 1;     /* local APFS on macOS; stock local POSIX on Linux */
+  pInfo->locking_method = 1; /* stock posixIoMethods */
+  return SQLITE_OK;
+}
+
+SQLITE_API int sqlite3_aiik_descriptor_test_forbidden_open(void){
+  unixFile file;
+  int outFlags = 0;
+  int rc = sqlite3_initialize();
+  if( rc!=SQLITE_OK ) return rc;
+  memset(&file, 0, sizeof(file));
+  return aiikDescriptorVfsOpen(
+      &aiikDescriptorVfs, "forbidden", (sqlite3_file*)&file,
+      SQLITE_OPEN_TEMP_DB|SQLITE_OPEN_READWRITE, &outFlags
+  );
+}
+
+SQLITE_API void sqlite3_aiik_descriptor_test_inject_early_failure(int enabled){
+  aiikDescriptorInjectEarlyFailure = enabled!=0;
+}
+
+SQLITE_API int sqlite3_aiik_descriptor_test_outstanding_duplicates(void){
+  return aiikDescriptorOutstandingDuplicates;
 }
 
 #endif /* SQLITE_OS_UNIX */

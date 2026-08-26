@@ -7955,9 +7955,30 @@ struct sqlite3_aiik_descriptor_file {
   sqlite3_uint64 link_count;
   unsigned int file_type;
 };
+#define AIIK_DESCRIPTOR_SOURCE 1
+#define AIIK_DESCRIPTOR_DESTINATION 2
 SQLITE_API int sqlite3_aiik_descriptor_validate(
   const sqlite3_aiik_descriptor_file*, int
 );
+typedef struct sqlite3_aiik_descriptor_info sqlite3_aiik_descriptor_info;
+struct sqlite3_aiik_descriptor_info {
+  int descriptor_vfs;
+  sqlite3_uint64 device;
+  sqlite3_uint64 inode;
+  sqlite3_uint64 link_count;
+  unsigned int file_type;
+  unsigned int filesystem;
+  unsigned int locking_method;
+};
+SQLITE_API int sqlite3_aiik_descriptor_open(
+  const sqlite3_aiik_descriptor_file*, int, sqlite3**
+);
+SQLITE_API int sqlite3_aiik_descriptor_inspect(
+  sqlite3*, sqlite3_aiik_descriptor_info*
+);
+SQLITE_API int sqlite3_aiik_descriptor_test_forbidden_open(void);
+SQLITE_API void sqlite3_aiik_descriptor_test_inject_early_failure(int);
+SQLITE_API int sqlite3_aiik_descriptor_test_outstanding_duplicates(void);
 
 /*
 ** CAPI3REF: Mutexes
