@@ -7947,6 +7947,7 @@ SQLITE_API int sqlite3_vfs_unregister(sqlite3_vfs*);
 ** build-tag-gated Go adapter. They intentionally accept file descriptors,
 ** never locators.
 */
+#ifdef SQLITE_AIIK_DESCRIPTOR_VFS
 typedef struct sqlite3_aiik_descriptor_file sqlite3_aiik_descriptor_file;
 struct sqlite3_aiik_descriptor_file {
   int fd;
@@ -7979,6 +7980,12 @@ SQLITE_API int sqlite3_aiik_descriptor_inspect(
 SQLITE_API int sqlite3_aiik_descriptor_test_forbidden_open(void);
 SQLITE_API void sqlite3_aiik_descriptor_test_inject_early_failure(int);
 SQLITE_API int sqlite3_aiik_descriptor_test_outstanding_duplicates(void);
+SQLITE_API int sqlite3_aiik_descriptor_test_consume_wal(sqlite3*);
+SQLITE_API int sqlite3_aiik_descriptor_test_adopt_shm(sqlite3*);
+SQLITE_API int sqlite3_aiik_descriptor_test_mismatch_shm(sqlite3*);
+SQLITE_API int sqlite3_aiik_descriptor_test_hold_stock_shm(sqlite3*);
+SQLITE_API int sqlite3_aiik_descriptor_test_release_stock_shm(sqlite3*);
+#endif /* SQLITE_AIIK_DESCRIPTOR_VFS */
 
 /*
 ** CAPI3REF: Mutexes

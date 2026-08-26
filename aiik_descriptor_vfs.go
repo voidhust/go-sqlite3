@@ -1,8 +1,9 @@
-//go:build aiik_descriptor_vfs && cgo && (darwin || linux)
+//go:build aiik_descriptor_vfs && cgo && (darwin || linux) && !libsqlite3
 
 package sqlite3
 
 /*
+#cgo CFLAGS: -DSQLITE_AIIK_DESCRIPTOR_VFS
 #ifndef USE_LIBSQLITE3
 #include "sqlite3-binding.h"
 #else
@@ -13,6 +14,7 @@ import "C"
 
 import (
 	"errors"
+	"fmt"
 	"runtime"
 	"time"
 )
@@ -142,10 +144,13 @@ func InspectAIIKUnixConnection(conn *SQLiteConn) (AIIKUnixConnectionInfo, error)
 }
 
 func aiikFilesystemName(value uint32) string {
-	if value == 1 {
-		return "local"
+	if runtime.GOOS == "darwin" && value == 1 {
+		return "apfs"
 	}
-	return "unknown"
+	if value == 0 {
+		return "unknown"
+	}
+	return fmt.Sprintf("unix-fstype-0x%x", value)
 }
 
 func aiikLockingMethodName(value uint32) string {
@@ -172,4 +177,39 @@ func aiikTestInjectEarlyFailure(enabled bool) {
 
 func aiikTestOutstandingDuplicates() int {
 	return int(C.sqlite3_aiik_descriptor_test_outstanding_duplicates())
+}
+
+func aiikTestConsumeWAL(conn *SQLiteConn) error {
+	if rc := C.sqlite3_aiik_descriptor_test_consume_wal(conn.db); rc != C.SQLITE_OK {
+		return Error{Code: ErrNo(rc)}
+	}
+	return nil
+}
+
+func aiikTestAdoptSHM(conn *SQLiteConn) error {
+	if rc := C.sqlite3_aiik_descriptor_test_adopt_shm(conn.db); rc != C.SQLITE_OK {
+		return Error{Code: ErrNo(rc)}
+	}
+	return nil
+}
+
+func aiikTestMismatchSHM(conn *SQLiteConn) error {
+	if rc := C.sqlite3_aiik_descriptor_test_mismatch_shm(conn.db); rc != C.SQLITE_OK {
+		return Error{Code: ErrNo(rc)}
+	}
+	return nil
+}
+
+func aiikTestHoldStockSHM(conn *SQLiteConn) error {
+	if rc := C.sqlite3_aiik_descriptor_test_hold_stock_shm(conn.db); rc != C.SQLITE_OK {
+		return Error{Code: ErrNo(rc)}
+	}
+	return nil
+}
+
+func aiikTestReleaseStockSHM(conn *SQLiteConn) error {
+	if rc := C.sqlite3_aiik_descriptor_test_release_stock_shm(conn.db); rc != C.SQLITE_OK {
+		return Error{Code: ErrNo(rc)}
+	}
+	return nil
 }
