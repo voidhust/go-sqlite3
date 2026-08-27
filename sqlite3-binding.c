@@ -44737,7 +44737,7 @@ static int aiikDescriptorIsExactStockUnix(unixFile *pFile){
   sqlite3_vfs *pStock = sqlite3_vfs_find("unix");
   return pStock!=0 && pFile->pVfs==pStock && pStock->xOpen==unixOpen
       && pFile->pMethod==&posixIoMethods
-      && (pFile->ctrlFlags&(UNIXFILE_EXCL|UNIXFILE_NOLOCK))==0;
+      && (pFile->ctrlFlags&(UNIXFILE_EXCL|UNIXFILE_NOLOCK|UNIXFILE_RDONLY))==0;
 }
 
 static const sqlite3_io_methods *aiikDescriptorCapabilityIoFinderImpl(

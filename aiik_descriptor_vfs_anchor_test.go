@@ -95,3 +95,28 @@ func TestAIIKUnixConnectionInspectionRejectsNonExactStockProfiles(t *testing.T) 
 		})
 	}
 }
+
+func TestAIIKUnixConnectionInspectionRejectsReadOnlyWALAnchor(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "readonly.db")
+	writerRaw, err := (&SQLiteDriver{}).Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer writerRaw.Close()
+	writer := writerRaw.(*SQLiteConn)
+	if _, err := writer.Exec("PRAGMA journal_mode=WAL", nil); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := writer.Exec("CREATE TABLE readonly_fixture (id INTEGER)", nil); err != nil {
+		t.Fatal(err)
+	}
+
+	readerRaw, err := (&SQLiteDriver{}).Open("file:" + path + "?mode=ro&vfs=unix")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer readerRaw.Close()
+	if _, err := InspectAIIKUnixConnection(readerRaw.(*SQLiteConn)); err == nil {
+		t.Fatal("inspection accepted read-only stock unix WAL anchor")
+	}
+}
