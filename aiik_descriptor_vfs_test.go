@@ -50,31 +50,29 @@ func aiikTestSource(t *testing.T, dir string) AIIKDescriptorSource {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := conn.(*SQLiteConn).Exec("CREATE TABLE source_fixture (id INTEGER)", nil); err != nil {
+	stock := conn.(*SQLiteConn)
+	if _, err := stock.Exec("PRAGMA journal_mode=WAL", nil); err != nil {
 		t.Fatal(err)
 	}
-	if err := conn.Close(); err != nil {
+	if _, err := stock.Exec("CREATE TABLE source_fixture (id INTEGER)", nil); err != nil {
 		t.Fatal(err)
 	}
+	anchor, err := InspectAIIKUnixConnection(stock)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = conn.Close() })
 	db, err := os.Open(path)
 	if err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = db.Close() })
-	walPath := filepath.Join(dir, "source.db-wal")
-	walWritable, err := os.Create(walPath)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := walWritable.Close(); err != nil {
-		t.Fatal(err)
-	}
-	wal, err := os.Open(walPath)
+	wal, err := os.Open(filepath.Join(dir, "source.db-wal"))
 	if err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = wal.Close() })
-	shm, err := os.Create(filepath.Join(dir, "source.db-shm"))
+	shm, err := os.OpenFile(filepath.Join(dir, "source.db-shm"), os.O_RDWR, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -84,15 +82,7 @@ func aiikTestSource(t *testing.T, dir string) AIIKDescriptorSource {
 		WAL:      aiikTestDescriptorFile(t, wal),
 		SHM:      aiikTestDescriptorFile(t, shm),
 	}
-	source.Anchor = AIIKUnixConnectionInfo{
-		Database:      AIIKDescriptorIdentity{Device: source.Database.Device, Inode: source.Database.Inode, LinkCount: source.Database.LinkCount, FileType: source.Database.FileType},
-		WALPresent:    true,
-		WAL:           AIIKDescriptorIdentity{Device: source.WAL.Device, Inode: source.WAL.Inode, LinkCount: source.WAL.LinkCount, FileType: source.WAL.FileType},
-		SHMPresent:    true,
-		SHM:           AIIKDescriptorIdentity{Device: source.SHM.Device, Inode: source.SHM.Inode, LinkCount: source.SHM.LinkCount, FileType: source.SHM.FileType},
-		Filesystem:    "apfs",
-		LockingMethod: "posix",
-	}
+	source.Anchor = anchor
 	return source
 }
 
@@ -136,9 +126,26 @@ func TestAIIKDescriptorVFSOpensExactSourceThroughPrivateVFS(t *testing.T) {
 	if !info.DescriptorVFS {
 		t.Fatal("source did not reach the private descriptor VFS")
 	}
+	if err := aiikTestMainLifecycle(conn); err != nil {
+		t.Fatalf("descriptor main lifecycle consulted its opaque token namespace: %v", err)
+	}
 
 	if _, err := OpenAIIKDescriptorSource(source); err == nil {
 		t.Fatal("OpenAIIKDescriptorSource accepted a duplicate live endpoint use")
+	}
+}
+
+func TestAIIKDescriptorVFSTokenCollisionExhaustionIsBounded(t *testing.T) {
+	aiikTestTokenCollision(true, 1)
+	t.Cleanup(func() { aiikTestTokenCollision(false, 0) })
+
+	first, err := OpenAIIKDescriptorSource(aiikTestSource(t, t.TempDir()))
+	if err != nil {
+		t.Fatalf("first fixed-token source open: %v", err)
+	}
+	t.Cleanup(func() { _ = first.Close() })
+	if _, err := OpenAIIKDescriptorSource(aiikTestSource(t, t.TempDir())); err == nil {
+		t.Fatal("fixed-token collision did not exhaust its bounded registration attempts")
 	}
 }
 

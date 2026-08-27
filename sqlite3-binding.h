@@ -7995,6 +7995,8 @@ SQLITE_API int sqlite3_aiik_descriptor_test_adopt_shm(sqlite3*);
 SQLITE_API int sqlite3_aiik_descriptor_test_mismatch_shm(sqlite3*);
 SQLITE_API int sqlite3_aiik_descriptor_test_hold_stock_shm(sqlite3*);
 SQLITE_API int sqlite3_aiik_descriptor_test_release_stock_shm(sqlite3*);
+SQLITE_API int sqlite3_aiik_descriptor_test_main_lifecycle(sqlite3*);
+SQLITE_API void sqlite3_aiik_descriptor_test_token_collision(int, int);
 #endif /* SQLITE_AIIK_DESCRIPTOR_VFS_TEST */
 #endif /* SQLITE_AIIK_DESCRIPTOR_VFS */
 

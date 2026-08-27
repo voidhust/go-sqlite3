@@ -1782,14 +1782,18 @@ func (d *SQLiteDriver) Open(dsn string) (driver.Conn, error) {
 
 // Close the connection.
 func (c *SQLiteConn) Close() error {
-	rv := C.sqlite3_close_v2(c.db)
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	db := c.db
+	if db == nil {
+		return nil
+	}
+	rv := C.sqlite3_close_v2(db)
 	if rv != C.SQLITE_OK {
-		return c.lastError()
+		return lastError(db)
 	}
 	deleteHandles(c)
-	c.mu.Lock()
 	c.db = nil
-	c.mu.Unlock()
 	runtime.SetFinalizer(c, nil)
 	return nil
 }

@@ -61,3 +61,18 @@ func aiikTestReleaseStockSHM(conn *SQLiteConn) error {
 	}
 	return nil
 }
+
+func aiikTestMainLifecycle(conn *SQLiteConn) error {
+	if rc := C.sqlite3_aiik_descriptor_test_main_lifecycle(conn.db); rc != C.SQLITE_OK {
+		return Error{Code: ErrNo(rc)}
+	}
+	return nil
+}
+
+func aiikTestTokenCollision(enabled bool, attempts int) {
+	value := C.int(0)
+	if enabled {
+		value = 1
+	}
+	C.sqlite3_aiik_descriptor_test_token_collision(value, C.int(attempts))
+}

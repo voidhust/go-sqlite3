@@ -182,7 +182,12 @@ func OpenAIIKDescriptorDestination(destination AIIKDescriptorDestination) (*SQLi
 // InspectAIIKUnixConnection returns value-only metadata for an active Unix
 // connection, including a retained stock anchor.
 func InspectAIIKUnixConnection(conn *SQLiteConn) (AIIKUnixConnectionInfo, error) {
-	if conn == nil || conn.db == nil {
+	if conn == nil {
+		return AIIKUnixConnectionInfo{}, errors.New("sqlite3: nil AIIK Unix connection")
+	}
+	conn.mu.Lock()
+	defer conn.mu.Unlock()
+	if conn.db == nil {
 		return AIIKUnixConnectionInfo{}, errors.New("sqlite3: nil AIIK Unix connection")
 	}
 	var info C.sqlite3_aiik_descriptor_info
