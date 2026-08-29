@@ -27,6 +27,10 @@ func aiikTestOutstandingDuplicates() int {
 	return int(C.sqlite3_aiik_descriptor_test_outstanding_duplicates())
 }
 
+func aiikTestLinuxFilesystemAllowed(filesystem uint32) bool {
+	return C.sqlite3_aiik_descriptor_test_linux_filesystem_allowed(C.uint(filesystem)) != 0
+}
+
 func aiikTestConsumeWAL(conn *SQLiteConn) error {
 	if rc := C.sqlite3_aiik_descriptor_test_consume_wal(conn.db); rc != C.SQLITE_OK {
 		return Error{Code: ErrNo(rc)}

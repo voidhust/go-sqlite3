@@ -44700,6 +44700,18 @@ static int aiikDescriptorRequiredMode(int eKind, int eRole){
   return O_RDWR;
 }
 
+#if defined(__linux__)
+/* A descriptor alone cannot prove safe POSIX locking on every Linux mount. */
+#define AIIK_LINUX_EXT4_SUPER_MAGIC 0xEF53
+#define AIIK_LINUX_XFS_SUPER_MAGIC 0x58465342
+#define AIIK_LINUX_BTRFS_SUPER_MAGIC 0x9123683E
+static int aiikDescriptorLinuxFilesystemAllowed(long filesystemType){
+  return filesystemType==AIIK_LINUX_EXT4_SUPER_MAGIC
+      || filesystemType==AIIK_LINUX_XFS_SUPER_MAGIC
+      || filesystemType==AIIK_LINUX_BTRFS_SUPER_MAGIC;
+}
+#endif
+
 static int aiikDescriptorMeasureFilesystem(int fd, unsigned int *pFilesystem){
   struct statfs fsInfo;
   if( fstatfs(fd, &fsInfo)!=0 ) return SQLITE_IOERR_ACCESS;
@@ -44709,6 +44721,9 @@ static int aiikDescriptorMeasureFilesystem(int fd, unsigned int *pFilesystem){
   ) return SQLITE_CANTOPEN_BKPT;
   *pFilesystem = 1;  /* measured local APFS */
 #else
+  if( !aiikDescriptorLinuxFilesystemAllowed(fsInfo.f_type) ){
+    return SQLITE_CANTOPEN_BKPT;
+  }
   *pFilesystem = (unsigned int)fsInfo.f_type;
 #endif
   return SQLITE_OK;
@@ -44724,6 +44739,10 @@ static int aiikDescriptorLockingMethodFromCapability(int fd, unsigned int *pMeth
   if( !(fsInfo.f_flags&MNT_LOCAL)
    || strncmp(fsInfo.f_fstypename, "apfs", 5)!=0
   ) return SQLITE_CANTOPEN_BKPT;
+#else
+  if( !aiikDescriptorLinuxFilesystemAllowed(fsInfo.f_type) ){
+    return SQLITE_CANTOPEN_BKPT;
+  }
 #endif
   memset(&lockInfo, 0, sizeof(lockInfo));
   lockInfo.l_len = 1;
@@ -47222,6 +47241,17 @@ SQLITE_API int sqlite3_aiik_descriptor_test_outstanding_duplicates(void){
   result = aiikDescriptorOutstandingDuplicates;
   sqlite3_mutex_leave(aiikDescriptorMutex);
   return result;
+}
+
+SQLITE_API int sqlite3_aiik_descriptor_test_linux_filesystem_allowed(
+  unsigned int filesystemType
+){
+#if defined(__linux__)
+  return aiikDescriptorLinuxFilesystemAllowed((long)filesystemType);
+#else
+  UNUSED_PARAMETER(filesystemType);
+  return 0;
+#endif
 }
 
 SQLITE_API void sqlite3_aiik_descriptor_test_token_collision(

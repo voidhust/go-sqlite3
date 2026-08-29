@@ -120,3 +120,14 @@ func TestAIIKUnixConnectionInspectionRejectsReadOnlyWALAnchor(t *testing.T) {
 		t.Fatal("inspection accepted read-only stock unix WAL anchor")
 	}
 }
+
+func TestAIIKDescriptorLinuxFilesystemCapabilityFailsClosed(t *testing.T) {
+	if !aiikTestLinuxFilesystemAllowed(0xEF53) {
+		t.Fatal("descriptor VFS rejected reviewed ext4 filesystem")
+	}
+	for _, filesystem := range []uint32{0x6969, 0xFF534D42, 0x794C7630} { // NFS, CIFS, overlay
+		if aiikTestLinuxFilesystemAllowed(filesystem) {
+			t.Fatalf("descriptor VFS accepted unreviewed Linux filesystem %#x", filesystem)
+		}
+	}
+}

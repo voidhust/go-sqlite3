@@ -7990,6 +7990,7 @@ SQLITE_API int sqlite3_aiik_descriptor_inspect(
 SQLITE_API int sqlite3_aiik_descriptor_test_forbidden_open(sqlite3*);
 SQLITE_API void sqlite3_aiik_descriptor_test_inject_early_failure(int);
 SQLITE_API int sqlite3_aiik_descriptor_test_outstanding_duplicates(void);
+SQLITE_API int sqlite3_aiik_descriptor_test_linux_filesystem_allowed(unsigned int);
 SQLITE_API int sqlite3_aiik_descriptor_test_consume_wal(sqlite3*);
 SQLITE_API int sqlite3_aiik_descriptor_test_adopt_shm(sqlite3*);
 SQLITE_API int sqlite3_aiik_descriptor_test_mismatch_shm(sqlite3*);
